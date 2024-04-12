@@ -180,7 +180,7 @@ def train(hyp, opt, device, callbacks):
             weights = attempt_download(weights)  # download if not found locally
         ckpt = torch.load(weights, map_location="cpu")  # load checkpoint to CPU to avoid CUDA memory leak
         print(device)
-        model = Model(cfg or ckpt["model"].yaml, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
+        model = Model(cfg or ckpt["model"].yaml, ch=3, nc=nc, anchors=hyp.get("anchors")).half().to(device)  # create
         exclude = ["anchor"] if (cfg or hyp.get("anchors")) and not resume else []  # exclude keys
         csd = ckpt["model"].float().state_dict()  # checkpoint state_dict as FP32
         csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)  # intersect
@@ -291,10 +291,10 @@ def train(hyp, opt, device, callbacks):
     maps = np.zeros(nc)  # mAP per class
     results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
     scheduler.last_epoch = start_epoch - 1  # do not move
-    amp = False
-    scaler = torch.cuda.amp.GradScaler(enabled=amp)
-    # amp = True
-    # scaler = torch_tpu.tpu.amp.GradScaler(enabled=amp)
+    # amp = False
+    # scaler = torch.cuda.amp.GradScaler(enabled=amp)
+    amp = True
+    scaler = torch_tpu.tpu.amp.GradScaler(enabled=amp, allow_fp16=True)
     stopper, stop = EarlyStopping(patience=opt.patience), False
     compute_loss = ComputeLoss(model)  # init loss class
     callbacks.run("on_train_start")
@@ -321,26 +321,24 @@ def train(hyp, opt, device, callbacks):
             pbar = tqdm(pbar, total=nb, bar_format=TQDM_BAR_FORMAT)  # progress bar
         optimizer.zero_grad()
         for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+            # torch_tpu.tpu.OpTimer_reset()
             start_time = time.time()
-            torch_tpu.tpu.OpTimer_reset()
             callbacks.run("on_train_batch_start")
             ni = i + nb * epoch  # number integrated batches (since train start)
-            imgs = (imgs.float()/255).to(device)  # uint8 to float32, 0-255 to 0.0-1.0
-
+            imgs = (imgs.float()/255).half().to(device)  # uint8 to float32, 0-255 to 0.0-1.0
             # Warmup
-            if ni <= nw:
-                xi = [0, nw]  # x interp
-                accumulate = max(1, np.interp(ni, xi, [1, nbs / batch_size]).round())
-                for j, x in enumerate(optimizer.param_groups):
-                    # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
-                    x["lr"] = np.interp(ni, xi, [hyp["warmup_bias_lr"] if j == 0 else 0.0, x["initial_lr"] * lf(epoch)])
-                    if "momentum" in x:
-                        x["momentum"] = np.interp(ni, xi, [hyp["warmup_momentum"], hyp["momentum"]])
+            # if ni <= nw:
+            #     xi = [0, nw]  # x interp
+            #     accumulate = max(1, np.interp(ni, xi, [1, nbs / batch_size]).round())
+            #     for j, x in enumerate(optimizer.param_groups):
+            #         # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
+            #         x["lr"] = np.interp(ni, xi, [hyp["warmup_bias_lr"] if j == 0 else 0.0, x["initial_lr"] * lf(epoch)])
+            #         if "momentum" in x:
+            #             x["momentum"] = np.interp(ni, xi, [hyp["warmup_momentum"], hyp["momentum"]])
             
             # Forward
             pred = model(imgs)  # forward
-            # pred_f32 = [i.type(torch.float32) for i in pred]
-            pred_f32 = pred
+            pred_f32 = [i.type(torch.float32) for i in pred]
             loss, loss_items = compute_loss(pred_f32, targets.to(device))  # loss scaled by batch_size
             # check loss
             # Backward
@@ -353,8 +351,9 @@ def train(hyp, opt, device, callbacks):
                 scaler.update()
                 optimizer.zero_grad()
                 last_opt_step = ni
-            torch_tpu.tpu.OpTimer_dump()
-            print("time: ", time.time() - start_time)
+            # torch_tpu.tpu.OpTimer_dump()
+            end_time = time.time()
+            # print("time: ", end_time - start_time)
             # Log
             if RANK in {-1, 0}:
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
@@ -367,7 +366,6 @@ def train(hyp, opt, device, callbacks):
                 if callbacks.stop_training:
                     return
             # end batch ------------------------------------------------------------------------------------------------
-
         # Scheduler
         lr = [x["lr"] for x in optimizer.param_groups]  # for loggers
         scheduler.step()
@@ -386,7 +384,7 @@ def train(hyp, opt, device, callbacks):
                     single_cls=single_cls,
                     dataloader=val_loader,
                     save_dir=save_dir,
-                    plots=False,
+                    plots=True,
                     callbacks=callbacks,
                     compute_loss=compute_loss,
                 )

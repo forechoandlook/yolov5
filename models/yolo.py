@@ -119,10 +119,10 @@ class Detect(nn.Module):
         d = self.anchors[i].device
         t = self.anchors[i].dtype
         shape = 1, self.na, ny, nx, 2  # grid shape
-        y, x = torch.arange(ny, device=d, dtype=t), torch.arange(nx, device=d, dtype=t)
+        y, x = torch.arange(ny, device=d).to(t), torch.arange(nx, device=d).to(t)
         yv, xv = torch.meshgrid(y, x, indexing="ij") if torch_1_10 else torch.meshgrid(y, x)  # torch>=0.7 compatibility
         grid = torch.stack((xv, yv), 2).expand(shape) - 0.5  # add grid offset, i.e. y = 2.0 * x - 0.5
-        anchor_grid = (self.anchors[i] * self.stride[i]).view((1, self.na, 1, 1, 2)).expand(shape)
+        anchor_grid = (self.anchors[i].cpu() * self.stride[i].cpu()).view((1, self.na, 1, 1, 2)).expand(shape).to(self.anchors[0].device)
         return grid, anchor_grid
 
 
@@ -164,6 +164,8 @@ class BaseModel(nn.Module):
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
             if profile:
                 self._profile_one_layer(m, x, dt)
+            # if hasattr(m, 'conv') and m.conv.weight.device == torch.device("tpu:0"):
+            #     import pdb;pdb.set_trace()
             x = m(x)  # run
             y.append(x if m.i in self.save else None)  # save output
             if visualize:
@@ -250,7 +252,6 @@ class DetectionModel(BaseModel):
             m.anchors /= m.stride.view(-1, 1, 1)
             self.stride = m.stride
             self._initialize_biases()  # only run once
-
         # Init weights, biases
         initialize_weights(self)
         self.info()

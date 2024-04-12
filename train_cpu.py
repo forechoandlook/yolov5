@@ -24,12 +24,6 @@ import yaml
 from torch.optim import lr_scheduler
 from tqdm import tqdm
 
-def wrap_fn(fn):
-    def new_fn(x):
-        return fn(x.cpu()).to(x.device)
-    return new_fn
-torch.atan = wrap_fn(torch.atan)
-
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
 if str(ROOT) not in sys.path:
@@ -91,6 +85,24 @@ RANK = int(os.getenv("RANK", -1))
 WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
 GIT_INFO = check_git_info()
 
+def save_weights_and_gradients(model, optimizer, save_dir):
+    # 创建保存权重和梯度的目录
+    os.makedirs(save_dir, exist_ok=True)
+
+    # 保存模型权重
+    torch.save(model.state_dict(), os.path.join(save_dir, 'model_weights.pth'))
+
+    # 保存优化器状态
+    torch.save(optimizer.state_dict(), os.path.join(save_dir, 'optimizer_state.pth'))
+
+    # 保存模型的梯度
+    gradients = {}
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            gradients[name] = param.grad.clone().detach()
+        else:
+            gradients[name] = None
+    torch.save(gradients, os.path.join(save_dir, 'gradients.pth'))
 
 def train(hyp, opt, device, callbacks):
     """
@@ -114,7 +126,6 @@ def train(hyp, opt, device, callbacks):
         opt.workers,
         opt.freeze,
     )
-    # device = torch.device("tpu:2")
     callbacks.run("on_pretrain_routine_start")
 
     # Directories
@@ -179,7 +190,6 @@ def train(hyp, opt, device, callbacks):
         with torch_distributed_zero_first(LOCAL_RANK):
             weights = attempt_download(weights)  # download if not found locally
         ckpt = torch.load(weights, map_location="cpu")  # load checkpoint to CPU to avoid CUDA memory leak
-        print(device)
         model = Model(cfg or ckpt["model"].yaml, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
         exclude = ["anchor"] if (cfg or hyp.get("anchors")) and not resume else []  # exclude keys
         csd = ckpt["model"].float().state_dict()  # checkpoint state_dict as FP32
@@ -212,7 +222,7 @@ def train(hyp, opt, device, callbacks):
     nbs = 64  # nominal batch size
     accumulate = max(round(nbs / batch_size), 1)  # accumulate loss before optimizing
     hyp["weight_decay"] *= batch_size * accumulate / nbs  # scale weight_decay
-    optimizer = smart_optimizer(model, opt.optimizer, hyp["lr0"], hyp["momentum"], hyp["weight_decay"])
+    optimizer = smart_optimizer(model, opt.optimizer, hyp["lr0"]/10, hyp["momentum"], hyp["weight_decay"])
     # Scheduler
     if opt.cos_lr:
         lf = one_cycle(1, hyp["lrf"], epochs)  # cosine 1->hyp['lrf']
@@ -224,6 +234,14 @@ def train(hyp, opt, device, callbacks):
     best_fitness, start_epoch = 0.0, 0
     if pretrained:
         del ckpt, csd
+
+    # DP mode
+    if cuda and RANK == -1 and torch.cuda.device_count() > 1:
+        LOGGER.warning(
+            "WARNING ⚠️ DP not recommended, use torch.distributed.run for best DDP Multi-GPU results.\n"
+            "See Multi-GPU Tutorial at https://docs.ultralytics.com/yolov5/tutorials/multi_gpu_training to get started."
+        )
+        model = torch.nn.DataParallel(model)
 
     # Trainloader
     train_loader, dataset = create_dataloader(
@@ -282,6 +300,12 @@ def train(hyp, opt, device, callbacks):
     model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
     model.names = names
 
+    # ====================================
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Dropout):
+            module.p = 0.0
+    # ====================================
+
     # Start training
     t0 = time.time()
     nb = len(train_loader)  # number of batches
@@ -291,10 +315,8 @@ def train(hyp, opt, device, callbacks):
     maps = np.zeros(nc)  # mAP per class
     results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
     scheduler.last_epoch = start_epoch - 1  # do not move
-    amp = False
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
-    # amp = True
-    # scaler = torch_tpu.tpu.amp.GradScaler(enabled=amp)
+    # scaler = torch_tpu.tpu.amp.GradScaler(enabled=amp, init_scale=1)
     stopper, stop = EarlyStopping(patience=opt.patience), False
     compute_loss = ComputeLoss(model)  # init loss class
     callbacks.run("on_train_start")
@@ -321,8 +343,6 @@ def train(hyp, opt, device, callbacks):
             pbar = tqdm(pbar, total=nb, bar_format=TQDM_BAR_FORMAT)  # progress bar
         optimizer.zero_grad()
         for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
-            start_time = time.time()
-            torch_tpu.tpu.OpTimer_reset()
             callbacks.run("on_train_batch_start")
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = (imgs.float()/255).to(device)  # uint8 to float32, 0-255 to 0.0-1.0
@@ -336,25 +356,31 @@ def train(hyp, opt, device, callbacks):
                     x["lr"] = np.interp(ni, xi, [hyp["warmup_bias_lr"] if j == 0 else 0.0, x["initial_lr"] * lf(epoch)])
                     if "momentum" in x:
                         x["momentum"] = np.interp(ni, xi, [hyp["warmup_momentum"], hyp["momentum"]])
-            
+
             # Forward
             pred = model(imgs)  # forward
-            # pred_f32 = [i.type(torch.float32) for i in pred]
-            pred_f32 = pred
-            loss, loss_items = compute_loss(pred_f32, targets.to(device))  # loss scaled by batch_size
+            loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
             # check loss
+            # import pdb;pdb.set_trace()
+            t = loss.cpu()
+            if torch.isnan(t) or torch.isinf(t):
+                idx = "error/{}_{}".format(epoch, i)
+                torch.save(imgs.cpu(), idx + "_img.pt")
+                torch.save(targets.cpu(), idx + "_targets.pt")
+                continue
             # Backward
             scaler.scale(loss).backward()
+            save_weights_and_gradients(model, optimizer, "./diff/cpu/{}_{}".format(epoch, i))            
             # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
             if 1:
+                print(loss.item(), loss_items[0].item(), loss_items[1].item(), loss_items[2].item())
                 scaler.unscale_(optimizer)  # unscale gradients
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)  # clip gradients
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # clip gradients
                 scaler.step(optimizer)  # optimizer.step
                 scaler.update()
                 optimizer.zero_grad()
                 last_opt_step = ni
-            torch_tpu.tpu.OpTimer_dump()
-            print("time: ", time.time() - start_time)
+
             # Log
             if RANK in {-1, 0}:
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
@@ -373,7 +399,7 @@ def train(hyp, opt, device, callbacks):
         scheduler.step()
         if RANK in {-1, 0}:
             # mAP
-            # continue
+            continue
             callbacks.run("on_train_epoch_end", epoch=epoch)
             final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
             if not noval or final_epoch:  # Calculate mAP
